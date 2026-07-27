@@ -449,24 +449,38 @@ public class SQLCompletionProcessor implements IContentAssistProcessor {
 
         @Override
         public void assistSessionStarted(ContentAssistEvent event) {
-            SQLCompletionProcessor.setSimpleMode(event.isAutoActivated);
-            contentAssistant.assistSessionStarted(event);
+            try {
+                SQLCompletionProcessor.setSimpleMode(event.isAutoActivated);
+                contentAssistant.assistSessionStarted(event);
+            } catch (Throwable e) {
+                // An exception thrown from a completion listener starves all listeners registered after it,
+                // including the platform's key binding restore in KeyBindingSupportForAssistant (see #9414)
+                log.error("Error handling content assist session start", e);
+            }
         }
 
         @Override
         public void assistSessionEnded(ContentAssistEvent event) {
-            simpleMode = false;
-            contentAssistant.setLastCompletionOffset(-1);
+            try {
+                simpleMode = false;
+                contentAssistant.setLastCompletionOffset(-1);
+            } catch (Throwable e) {
+                log.error("Error handling content assist session end", e);
+            }
         }
 
         @Override
         public void selectionChanged(ICompletionProposal proposal, boolean smartToggle) {
-            SQLCompletionActivityTracker activityTracker =
-                proposal instanceof SQLQueryCompletionProposal p ? p.getProposalContext().getActivityTracker() :
-                proposal instanceof SQLCompletionProposalBase p ? p.getRequest().getActivityTracker() : null;
+            try {
+                SQLCompletionActivityTracker activityTracker =
+                    proposal instanceof SQLQueryCompletionProposal p ? p.getProposalContext().getActivityTracker() :
+                    proposal instanceof SQLCompletionProposalBase p ? p.getRequest().getActivityTracker() : null;
 
-            if (activityTracker != null) {
-                activityTracker.selectionChanged();
+                if (activityTracker != null) {
+                    activityTracker.selectionChanged();
+                }
+            } catch (Throwable e) {
+                log.error("Error handling content assist selection change", e);
             }
         }
 
