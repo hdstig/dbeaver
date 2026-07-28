@@ -22,6 +22,7 @@ import org.eclipse.jface.text.contentassist.ICompletionListener;
 import org.eclipse.jface.text.contentassist.ICompletionProposal;
 import org.eclipse.swt.SWT;
 import org.eclipse.swt.events.VerifyEvent;
+import org.jkiss.code.Nullable;
 import org.jkiss.dbeaver.Log;
 import org.jkiss.dbeaver.ui.UIUtils;
 import org.jkiss.dbeaver.ui.editors.sql.SQLEditorBase;
@@ -42,16 +43,38 @@ public class SQLContentAssistant extends ContentAssistant {
     private int lastCompletionOffset = - 1;
     private volatile boolean restartRequested = false;
 
+    @Nullable
+    private AssistCommandHandlerGuard assistCommandHandlerGuard;
+
     public SQLContentAssistant(SQLEditorBase editor) {
         super(); // Sync. Maybe we should make it async
         this.editor = editor;
         enableColoredLabels(true);
         addCompletionListener(new SessionRestartListener());
-        AssistCommandHandlerGuard.install(this, editor.getSite() == null ? null : editor.getSite().getWorkbenchWindow());
+        this.assistCommandHandlerGuard = AssistCommandHandlerGuard.install(
+            this,
+            editor.getSite() == null ? null : editor.getSite().getWorkbenchWindow());
     }
 
     public void setLastCompletionOffset(int lastCompletionOffset) {
         this.lastCompletionOffset = lastCompletionOffset;
+    }
+
+    /**
+     * Exposes the inherited protected popup state to {@link AssistCommandHandlerGuard}, which uses
+     * live popup state instead of event bookkeeping to decide whether a session is in progress.
+     */
+    boolean isProposalPopupCurrentlyActive() {
+        return isProposalPopupActive();
+    }
+
+    @Override
+    public void uninstall() {
+        if (assistCommandHandlerGuard != null) {
+            assistCommandHandlerGuard.dispose();
+            assistCommandHandlerGuard = null;
+        }
+        super.uninstall();
     }
 
     public void setSorter(SQLCompletionSorterUI sorter) {
