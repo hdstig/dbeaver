@@ -24,22 +24,24 @@ import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
+import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 
 /**
  * Tests for the {@link AssistCommandHandlerGuard.GuardState} snapshot/repair state machine
- * (see #9414). Uses a fake {@link AssistCommandHandlerGuard.CommandAccess} and a fake clock,
- * so no workbench is needed.
+ * (see #9414). Uses a fake {@link AssistCommandHandlerGuard.CommandAccess} and fake popup
+ * owners, so no workbench is needed.
  */
 public class AssistCommandHandlerGuardTest {
 
     private static final String LINE_START = ITextEditorActionDefinitionIds.LINE_START;
     private static final String LINE_END = ITextEditorActionDefinitionIds.LINE_END;
 
-    /** Stand-ins for the per-editor assist sessions the guard keys its tracking on. */
-    private static final Object SESSION_A = new Object();
-    private static final Object SESSION_B = new Object();
+    /** Stand-ins for editor parts; the guard keys cached handlers on part identity. */
+    private static final Object EDITOR_A = new Object();
+    private static final Object EDITOR_B = new Object();
 
     private static class FakeHandler extends AbstractHandler {
         private final boolean handled;
@@ -63,9 +65,24 @@ public class AssistCommandHandlerGuardTest {
         }
     }
 
+    /** Fake assist session: reports popup state the way a real assistant would. */
+    private static class FakePopup implements AssistPopupOwner {
+        private boolean popupActive;
+        private boolean broken;
+
+        @Override
+        public boolean isOwnPopupActive() {
+            if (broken) {
+                throw new IllegalStateException("assistant is broken");
+            }
+            return popupActive;
+        }
+    }
+
     private static class FakeCommandAccess implements AssistCommandHandlerGuard.CommandAccess {
         private final Map<String, IHandler> handlers = new HashMap<>();
         private boolean available = true;
+        private Object activePart = EDITOR_A;
 
         @Override
         public boolean isAvailable() {
@@ -87,19 +104,25 @@ public class AssistCommandHandlerGuardTest {
         public void setHandler(String commandId, IHandler handler) {
             handlers.put(commandId, handler);
         }
+
+        @Override
+        public Object activePartKey() {
+            return activePart;
+        }
     }
 
     private FakeCommandAccess commands;
     private AssistCommandHandlerGuard.GuardState state;
+    private FakePopup session;
     private IHandler lineStartHandler;
     private IHandler lineEndHandler;
-    private long now;
 
     @BeforeEach
     public void setUp() {
         commands = new FakeCommandAccess();
-        now = 1_000_000L;
-        state = new AssistCommandHandlerGuard.GuardState(commands, () -> now);
+        state = new AssistCommandHandlerGuard.GuardState(commands);
+        session = new FakePopup();
+        state.registerPopupOwner(session);
         lineStartHandler = new FakeHandler();
         lineEndHandler = new FakeHandler();
         commands.setHandler(LINE_START, lineStartHandler);
@@ -108,17 +131,18 @@ public class AssistCommandHandlerGuardTest {
 
     /** Simulates KeyBindingSupportForAssistant nulling the handlers at session start. */
     private void platformNullsHandlers() {
-        commands.setHandler(LINE_START, null);
-        commands.setHandler(LINE_END, null);
+        for (String commandId : AssistCommandHandlerGuard.GUARDED_COMMAND_IDS) {
+            commands.setHandler(commandId, null);
+        }
     }
 
     @Test
     public void healthySnapshotIsRestoredAfterStarvedRestore() {
         state.snapshot();
 
-        state.sessionStarted(SESSION_A);
+        session.popupActive = true;
         platformNullsHandlers();
-        state.sessionEnded(SESSION_A);
+        session.popupActive = false;
         // the platform restore was starved (a listener threw): handlers stay null
 
         state.repair();
@@ -128,87 +152,161 @@ public class AssistCommandHandlerGuardTest {
     }
 
     /**
-     * Regression: a session whose end event never arrives must not disable the guard forever.
-     * This is the same failure the guard exists to repair, so it must not be able to latch it
-     * into a permanently "session active" state.
+     * Regression for the defect that shipped: session state must come from live popup state, so a
+     * session whose end event never arrives cannot leave the guard permanently disabled. No
+     * further session and no part activation is needed - closing the popup is enough.
      */
     @Test
-    public void lostEndEventExpiresInsteadOfDisablingTheGuard() {
+    public void lostEndEventIsRepairedOnceThePopupIsGone() {
         state.snapshot();
 
-        state.sessionStarted(SESSION_A);
+        session.popupActive = true;
         platformNullsHandlers();
-        // no sessionEnded(): the end event was never delivered
 
         state.repair();
-        Assertions.assertNull(commands.getHandler(LINE_START), "the popup may still be open right now");
+        Assertions.assertNull(commands.getHandler(LINE_START), "the popup is still open");
 
-        now += AssistCommandHandlerGuard.GuardState.SESSION_STALE_MS + 1;
+        // No end event is ever delivered; the popup simply goes away
+        session.popupActive = false;
         state.repair();
 
         Assertions.assertSame(lineStartHandler, commands.getHandler(LINE_START),
-            "a stale session must not block repair");
+            "a lost end event must not leave the guard disabled");
     }
 
-    /** Regression: editor activation proves no popup is open, so leaked sessions are dropped. */
+    /** An open popup stays "active" no matter how much time passes: no timeout heuristic. */
     @Test
-    public void editorActivationClearsLeakedSessions() {
+    public void popupOpenIndefinitelyIsNeverRepairedPrematurely() {
         state.snapshot();
 
-        state.sessionStarted(SESSION_A);
+        session.popupActive = true;
         platformNullsHandlers();
-        // end event lost again
 
-        state.sessionsFinished();
+        for (int i = 0; i < 1000; i++) {
+            state.repair();
+            state.snapshot();
+        }
+
+        Assertions.assertNull(commands.getHandler(LINE_START),
+            "a popup left open must not be treated as a finished session");
+    }
+
+    /** Handlers belong to the editor they were captured from. */
+    @Test
+    public void activatingAnotherEditorNeverInstallsTheFirstEditorsHandler() {
+        state.snapshot(); // caches editor A's handlers
+
+        commands.activePart = EDITOR_B;
+        platformNullsHandlers();
         state.repair();
 
-        Assertions.assertSame(lineStartHandler, commands.getHandler(LINE_START));
+        Assertions.assertNull(commands.getHandler(LINE_START),
+            "editor A's handler must not be installed while editor B is active");
     }
 
-    /** Regression: snapshotting must also recover after a leaked session, not just repair. */
     @Test
-    public void snapshotRecoversAfterLeakedSession() {
-        state.sessionStarted(SESSION_A);
-        // leak, before anything was ever cached
-        state.sessionsFinished();
+    public void eachEditorIsRepairedWithItsOwnHandler() {
+        state.snapshot(); // editor A
 
+        commands.activePart = EDITOR_B;
+        IHandler lineStartForB = new FakeHandler();
+        commands.setHandler(LINE_START, lineStartForB);
+        state.snapshot(); // editor B
+
+        platformNullsHandlers();
+        state.repair();
+        Assertions.assertSame(lineStartForB, commands.getHandler(LINE_START), "editor B's own handler");
+
+        platformNullsHandlers();
+        commands.activePart = EDITOR_A;
+        state.repair();
+        Assertions.assertSame(lineStartHandler, commands.getHandler(LINE_START), "editor A's own handler");
+    }
+
+    /** Closing an editor must release its cached handlers. */
+    @Test
+    public void forgettingAPartReleasesItsCachedHandlers() {
         state.snapshot();
+
+        state.forgetPart(EDITOR_A);
+        platformNullsHandlers();
+        state.repair();
+
+        Assertions.assertNull(commands.getHandler(LINE_START), "cache for a closed editor must be gone");
+    }
+
+    /** Everything the guard claims to guard must actually be restored. */
+    @Test
+    public void everyGuardedCommandIsRestored() {
+        List<IHandler> healthy = new ArrayList<>();
+        for (String commandId : AssistCommandHandlerGuard.GUARDED_COMMAND_IDS) {
+            IHandler handler = new FakeHandler();
+            healthy.add(handler);
+            commands.setHandler(commandId, handler);
+        }
+        state.snapshot();
+
+        platformNullsHandlers();
+        state.repair();
+
+        for (int i = 0; i < AssistCommandHandlerGuard.GUARDED_COMMAND_IDS.length; i++) {
+            String commandId = AssistCommandHandlerGuard.GUARDED_COMMAND_IDS[i];
+            Assertions.assertSame(healthy.get(i), commands.getHandler(commandId),
+                "not restored: " + commandId);
+        }
+    }
+
+    /** The guarded list must not claim commands the platform only replaces (LINE_UP/LINE_DOWN). */
+    @Test
+    public void guardedListOnlyCoversNulledCommands() {
+        List<String> guarded = List.of(AssistCommandHandlerGuard.GUARDED_COMMAND_IDS);
+
+        Assertions.assertFalse(guarded.contains(ITextEditorActionDefinitionIds.LINE_UP),
+            "LINE_UP is replaced, not nulled, so the guard cannot restore it");
+        Assertions.assertFalse(guarded.contains(ITextEditorActionDefinitionIds.LINE_DOWN),
+            "LINE_DOWN is replaced, not nulled, so the guard cannot restore it");
+        Assertions.assertTrue(guarded.contains(LINE_START));
+        Assertions.assertTrue(guarded.contains(LINE_END));
+    }
+
+    /** A second editor's open popup must block repair, since the handlers are global. */
+    @Test
+    public void anotherEditorsOpenPopupBlocksRepair() {
+        state.snapshot();
+
+        FakePopup otherEditorSession = new FakePopup();
+        state.registerPopupOwner(otherEditorSession);
+        otherEditorSession.popupActive = true;
+
+        platformNullsHandlers();
+        state.repair();
+
+        Assertions.assertNull(commands.getHandler(LINE_START), "another assistant is mid-session");
+    }
+
+    /** A broken assistant must not be able to claim a session is running forever. */
+    @Test
+    public void aThrowingPopupOwnerDoesNotBlockRepair() {
+        state.snapshot();
+
+        session.broken = true;
         platformNullsHandlers();
         state.repair();
 
         Assertions.assertSame(lineStartHandler, commands.getHandler(LINE_START),
-            "a leaked session must not prevent the first snapshot");
+            "an assistant that fails to report state must not disable the guard");
     }
 
     @Test
-    public void noRepairWhileSessionIsActive() {
+    public void disposedGuardNoLongerBlocksRepair() {
         state.snapshot();
 
-        state.sessionStarted(SESSION_A);
+        session.popupActive = true;
         platformNullsHandlers();
+        state.unregisterPopupOwner(session);
 
         state.repair();
-        Assertions.assertNull(commands.getHandler(LINE_START), "must not repair during an active session");
 
-        state.sessionEnded(SESSION_A);
-        state.repair();
-        Assertions.assertSame(lineStartHandler, commands.getHandler(LINE_START));
-    }
-
-    @Test
-    public void noRepairWhileOverlappingSessionIsStillActive() {
-        state.snapshot();
-
-        state.sessionStarted(SESSION_A);
-        state.sessionStarted(SESSION_B);
-        platformNullsHandlers();
-        state.sessionEnded(SESSION_A);
-
-        state.repair();
-        Assertions.assertNull(commands.getHandler(LINE_START), "a second editor's session is still active");
-
-        state.sessionEnded(SESSION_B);
-        state.repair();
         Assertions.assertSame(lineStartHandler, commands.getHandler(LINE_START));
     }
 
@@ -245,9 +343,7 @@ public class AssistCommandHandlerGuardTest {
         commands.setHandler(LINE_START, replacement);
         state.snapshot();
 
-        state.sessionStarted(SESSION_A);
         platformNullsHandlers();
-        state.sessionEnded(SESSION_A);
         state.repair();
 
         Assertions.assertSame(replacement, commands.getHandler(LINE_START), "the latest healthy handler must win");
@@ -277,16 +373,16 @@ public class AssistCommandHandlerGuardTest {
     }
 
     @Test
-    public void noSnapshotDuringActiveSession() {
-        state.sessionStarted(SESSION_A);
+    public void noSnapshotWhileAPopupIsOpen() {
+        session.popupActive = true;
         state.snapshot();
-        state.sessionEnded(SESSION_A);
+        session.popupActive = false;
 
         platformNullsHandlers();
         state.repair();
 
         Assertions.assertNull(commands.getHandler(LINE_START),
-            "a snapshot taken during a session could cache the platform's replacement handlers");
+            "a snapshot taken mid-session could cache the platform's replacement handlers");
     }
 
     @Test
@@ -303,13 +399,15 @@ public class AssistCommandHandlerGuardTest {
     }
 
     @Test
-    public void unbalancedSessionEndIsHarmless() {
-        state.sessionEnded(SESSION_A);
-        Assertions.assertFalse(state.isSessionActive());
+    public void missingActiveEditorIsNoop() {
+        state.snapshot();
+        commands.activePart = null;
 
-        state.sessionStarted(SESSION_A);
-        Assertions.assertTrue(state.isSessionActive());
-        state.sessionEnded(SESSION_A);
-        Assertions.assertFalse(state.isSessionActive());
+        platformNullsHandlers();
+        Assertions.assertDoesNotThrow(() -> {
+            state.snapshot();
+            state.repair();
+        });
+        Assertions.assertNull(commands.getHandler(LINE_START));
     }
 }
