@@ -29,13 +29,17 @@ import java.util.Map;
 
 /**
  * Tests for the {@link AssistCommandHandlerGuard.GuardState} snapshot/repair state machine
- * (see #9414). Uses a fake {@link AssistCommandHandlerGuard.CommandAccess}, so no workbench
- * is needed.
+ * (see #9414). Uses a fake {@link AssistCommandHandlerGuard.CommandAccess} and a fake clock,
+ * so no workbench is needed.
  */
 public class AssistCommandHandlerGuardTest {
 
     private static final String LINE_START = ITextEditorActionDefinitionIds.LINE_START;
     private static final String LINE_END = ITextEditorActionDefinitionIds.LINE_END;
+
+    /** Stand-ins for the per-editor assist sessions the guard keys its tracking on. */
+    private static final Object SESSION_A = new Object();
+    private static final Object SESSION_B = new Object();
 
     private static class FakeHandler extends AbstractHandler {
         private final boolean handled;
@@ -89,11 +93,13 @@ public class AssistCommandHandlerGuardTest {
     private AssistCommandHandlerGuard.GuardState state;
     private IHandler lineStartHandler;
     private IHandler lineEndHandler;
+    private long now;
 
     @BeforeEach
     public void setUp() {
         commands = new FakeCommandAccess();
-        state = new AssistCommandHandlerGuard.GuardState(commands);
+        now = 1_000_000L;
+        state = new AssistCommandHandlerGuard.GuardState(commands, () -> now);
         lineStartHandler = new FakeHandler();
         lineEndHandler = new FakeHandler();
         commands.setHandler(LINE_START, lineStartHandler);
@@ -107,12 +113,12 @@ public class AssistCommandHandlerGuardTest {
     }
 
     @Test
-    public void healthySnapshotIsRestoredAfterLostSessionEnd() {
+    public void healthySnapshotIsRestoredAfterStarvedRestore() {
         state.snapshot();
 
-        state.sessionStarted();
+        state.sessionStarted(SESSION_A);
         platformNullsHandlers();
-        state.sessionEnded();
+        state.sessionEnded(SESSION_A);
         // the platform restore was starved (a listener threw): handlers stay null
 
         state.repair();
@@ -121,34 +127,87 @@ public class AssistCommandHandlerGuardTest {
         Assertions.assertSame(lineEndHandler, commands.getHandler(LINE_END));
     }
 
+    /**
+     * Regression: a session whose end event never arrives must not disable the guard forever.
+     * This is the same failure the guard exists to repair, so it must not be able to latch it
+     * into a permanently "session active" state.
+     */
+    @Test
+    public void lostEndEventExpiresInsteadOfDisablingTheGuard() {
+        state.snapshot();
+
+        state.sessionStarted(SESSION_A);
+        platformNullsHandlers();
+        // no sessionEnded(): the end event was never delivered
+
+        state.repair();
+        Assertions.assertNull(commands.getHandler(LINE_START), "the popup may still be open right now");
+
+        now += AssistCommandHandlerGuard.GuardState.SESSION_STALE_MS + 1;
+        state.repair();
+
+        Assertions.assertSame(lineStartHandler, commands.getHandler(LINE_START),
+            "a stale session must not block repair");
+    }
+
+    /** Regression: editor activation proves no popup is open, so leaked sessions are dropped. */
+    @Test
+    public void editorActivationClearsLeakedSessions() {
+        state.snapshot();
+
+        state.sessionStarted(SESSION_A);
+        platformNullsHandlers();
+        // end event lost again
+
+        state.sessionsFinished();
+        state.repair();
+
+        Assertions.assertSame(lineStartHandler, commands.getHandler(LINE_START));
+    }
+
+    /** Regression: snapshotting must also recover after a leaked session, not just repair. */
+    @Test
+    public void snapshotRecoversAfterLeakedSession() {
+        state.sessionStarted(SESSION_A);
+        // leak, before anything was ever cached
+        state.sessionsFinished();
+
+        state.snapshot();
+        platformNullsHandlers();
+        state.repair();
+
+        Assertions.assertSame(lineStartHandler, commands.getHandler(LINE_START),
+            "a leaked session must not prevent the first snapshot");
+    }
+
     @Test
     public void noRepairWhileSessionIsActive() {
         state.snapshot();
 
-        state.sessionStarted();
+        state.sessionStarted(SESSION_A);
         platformNullsHandlers();
 
         state.repair();
         Assertions.assertNull(commands.getHandler(LINE_START), "must not repair during an active session");
 
-        state.sessionEnded();
+        state.sessionEnded(SESSION_A);
         state.repair();
         Assertions.assertSame(lineStartHandler, commands.getHandler(LINE_START));
     }
 
     @Test
-    public void noRepairWhileNestedSessionIsStillActive() {
+    public void noRepairWhileOverlappingSessionIsStillActive() {
         state.snapshot();
 
-        state.sessionStarted();
-        state.sessionStarted();
+        state.sessionStarted(SESSION_A);
+        state.sessionStarted(SESSION_B);
         platformNullsHandlers();
-        state.sessionEnded();
+        state.sessionEnded(SESSION_A);
 
         state.repair();
-        Assertions.assertNull(commands.getHandler(LINE_START), "one of two overlapping sessions is still active");
+        Assertions.assertNull(commands.getHandler(LINE_START), "a second editor's session is still active");
 
-        state.sessionEnded();
+        state.sessionEnded(SESSION_B);
         state.repair();
         Assertions.assertSame(lineStartHandler, commands.getHandler(LINE_START));
     }
@@ -186,9 +245,9 @@ public class AssistCommandHandlerGuardTest {
         commands.setHandler(LINE_START, replacement);
         state.snapshot();
 
-        state.sessionStarted();
+        state.sessionStarted(SESSION_A);
         platformNullsHandlers();
-        state.sessionEnded();
+        state.sessionEnded(SESSION_A);
         state.repair();
 
         Assertions.assertSame(replacement, commands.getHandler(LINE_START), "the latest healthy handler must win");
@@ -219,9 +278,9 @@ public class AssistCommandHandlerGuardTest {
 
     @Test
     public void noSnapshotDuringActiveSession() {
-        state.sessionStarted();
+        state.sessionStarted(SESSION_A);
         state.snapshot();
-        state.sessionEnded();
+        state.sessionEnded(SESSION_A);
 
         platformNullsHandlers();
         state.repair();
@@ -244,13 +303,13 @@ public class AssistCommandHandlerGuardTest {
     }
 
     @Test
-    public void sessionCounterNeverGoesNegative() {
-        state.sessionEnded();
+    public void unbalancedSessionEndIsHarmless() {
+        state.sessionEnded(SESSION_A);
         Assertions.assertFalse(state.isSessionActive());
 
-        state.sessionStarted();
+        state.sessionStarted(SESSION_A);
         Assertions.assertTrue(state.isSessionActive());
-        state.sessionEnded();
+        state.sessionEnded(SESSION_A);
         Assertions.assertFalse(state.isSessionActive());
     }
 }
