@@ -47,6 +47,7 @@ public class SQLContentAssistant extends ContentAssistant {
         this.editor = editor;
         enableColoredLabels(true);
         addCompletionListener(new SessionRestartListener());
+        AssistCommandHandlerGuard.install(this, editor.getSite() == null ? null : editor.getSite().getWorkbenchWindow());
     }
 
     public void setLastCompletionOffset(int lastCompletionOffset) {
