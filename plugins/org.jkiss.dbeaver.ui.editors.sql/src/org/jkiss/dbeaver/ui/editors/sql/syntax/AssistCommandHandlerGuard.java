@@ -38,6 +38,7 @@ import java.util.HashMap;
 import java.util.Map;
 import java.util.Set;
 import java.util.WeakHashMap;
+import java.util.function.LongSupplier;
 
 /**
  * Watchdog for the global text navigation command handlers that
@@ -76,8 +77,10 @@ public class AssistCommandHandlerGuard implements ICompletionListener {
 
     /**
      * Installs the guard on the given assistant. Must be registered before any completion
-     * listener that may fail, so that the active session accounting stays accurate even when a
-     * later listener throws.
+     * listener that may fail, so that the session accounting stays accurate even when a later
+     * listener throws. Session tracking must never be able to latch permanently "active": the
+     * lost end event this class repairs is the same event that would leave it latched, which is
+     * why tracked sessions expire and are cleared on editor activation.
      */
     public static void install(ContentAssistant assistant, @Nullable IWorkbenchWindow window) {
         try {
@@ -98,6 +101,9 @@ public class AssistCommandHandlerGuard implements ICompletionListener {
             public void partActivated(IWorkbenchPartReference partRef) {
                 if (partRef instanceof IEditorReference) {
                     try {
+                        // Activating an editor means no proposal popup from an earlier session can
+                        // still be open, so this is a reliable point to forget leaked sessions
+                        STATE.sessionsFinished();
                         STATE.repair();
                         STATE.snapshot();
                     } catch (Throwable e) {
@@ -114,7 +120,7 @@ public class AssistCommandHandlerGuard implements ICompletionListener {
     @Override
     public void assistSessionStarted(ContentAssistEvent event) {
         try {
-            STATE.sessionStarted();
+            STATE.sessionStarted(this);
         } catch (Throwable e) {
             // Never propagate: an exception here starves the completion listeners
             // registered after this one (see #9414)
@@ -125,7 +131,7 @@ public class AssistCommandHandlerGuard implements ICompletionListener {
     @Override
     public void assistSessionEnded(ContentAssistEvent event) {
         try {
-            STATE.sessionEnded();
+            STATE.sessionEnded(this);
             // Deferred so that KeyBindingSupportForAssistant's own restore, which runs after this
             // listener in the same event loop, gets the first chance to put the handlers back
             UIUtils.asyncExec(() -> {
@@ -147,26 +153,53 @@ public class AssistCommandHandlerGuard implements ICompletionListener {
      * {@link CommandAccess} for unit testing. All methods must be called on the UI thread.
      */
     static class GuardState {
+        /**
+         * A session whose end event never arrived is treated as finished after this delay. Without
+         * an expiry the guard would disable itself on exactly the failure it exists to repair: a
+         * lost end event means {@link #sessionEnded} is never called (see #9414).
+         */
+        static final long SESSION_STALE_MS = 30_000;
+
         private final CommandAccess commands;
+        private final LongSupplier clock;
         private final Map<String, IHandler> knownHandlers = new HashMap<>();
-        private int activeSessions;
+        /** Start time per assist session; weakly keyed so disposed editors drop out. */
+        private final Map<Object, Long> sessionStarts = new WeakHashMap<>();
 
         GuardState(CommandAccess commands) {
+            this(commands, System::currentTimeMillis);
+        }
+
+        GuardState(CommandAccess commands, LongSupplier clock) {
             this.commands = commands;
+            this.clock = clock;
         }
 
-        void sessionStarted() {
-            activeSessions++;
+        void sessionStarted(Object session) {
+            sessionStarts.put(session, clock.getAsLong());
         }
 
-        void sessionEnded() {
-            if (activeSessions > 0) {
-                activeSessions--;
-            }
+        void sessionEnded(Object session) {
+            sessionStarts.remove(session);
+        }
+
+        /** Forgets all tracked sessions; used when the UI state proves none can be open. */
+        void sessionsFinished() {
+            sessionStarts.clear();
         }
 
         boolean isSessionActive() {
-            return activeSessions > 0;
+            long now = clock.getAsLong();
+            boolean active = false;
+            for (var it = sessionStarts.values().iterator(); it.hasNext(); ) {
+                Long startedAt = it.next();
+                if (startedAt == null || now - startedAt > SESSION_STALE_MS) {
+                    it.remove();
+                } else {
+                    active = true;
+                }
+            }
+            return active;
         }
 
         /** Caches the current handler of every guarded command that is currently handled. */
