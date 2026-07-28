@@ -18,8 +18,11 @@ package org.jkiss.dbeaver.ui.editors.sql.syntax;
 
 import org.eclipse.jface.text.contentassist.ContentAssistEvent;
 import org.eclipse.jface.text.contentassist.ContentAssistant;
+import org.eclipse.jface.text.contentassist.ICompletionListener;
+import org.eclipse.jface.text.contentassist.ICompletionProposal;
 import org.eclipse.swt.SWT;
 import org.eclipse.swt.events.VerifyEvent;
+import org.jkiss.dbeaver.Log;
 import org.jkiss.dbeaver.ui.UIUtils;
 import org.jkiss.dbeaver.ui.editors.sql.SQLEditorBase;
 import org.jkiss.dbeaver.ui.editors.sql.SQLEditorUtils;
@@ -29,6 +32,8 @@ import org.jkiss.dbeaver.ui.editors.sql.SQLPreferenceConstants;
  * SQL Completion proposal
  */
 public class SQLContentAssistant extends ContentAssistant {
+
+    private static final Log log = Log.getLog(SQLContentAssistant.class);
 
     private final SQLEditorBase editor;
 
@@ -41,14 +46,11 @@ public class SQLContentAssistant extends ContentAssistant {
         super(); // Sync. Maybe we should make it async
         this.editor = editor;
         enableColoredLabels(true);
+        addCompletionListener(new SessionRestartListener());
     }
 
     public void setLastCompletionOffset(int lastCompletionOffset) {
         this.lastCompletionOffset = lastCompletionOffset;
-        if (lastCompletionOffset == -1 && restartRequested) {
-            restartRequested = false;
-            UIUtils.asyncExec(() -> showPossibleCompletions());
-        }
     }
 
     public void setSorter(SQLCompletionSorterUI sorter) {
@@ -98,6 +100,37 @@ public class SQLContentAssistant extends ContentAssistant {
             }
 
             super.verifyKey(event);
+        }
+    }
+
+    /**
+     * Schedules the popup re-show requested by {@link SQLAutoAssistListener} only after the end of the
+     * previous assist session has actually been observed, so that a dying session never overlaps the
+     * restarted one (see #9414).
+     */
+    private class SessionRestartListener implements ICompletionListener {
+        @Override
+        public void assistSessionStarted(ContentAssistEvent event) {
+            // nothing to do
+        }
+
+        @Override
+        public void assistSessionEnded(ContentAssistEvent event) {
+            try {
+                if (restartRequested) {
+                    restartRequested = false;
+                    UIUtils.asyncExec(() -> showPossibleCompletions());
+                }
+            } catch (Throwable e) {
+                // Never propagate: an exception here starves the completion listeners
+                // registered after this one (see #9414)
+                log.error("Error scheduling completion session restart", e);
+            }
+        }
+
+        @Override
+        public void selectionChanged(ICompletionProposal proposal, boolean smartToggle) {
+            // nothing to do
         }
     }
 
