@@ -1,0 +1,7 @@
+PASS
+handledBefore=true
+handledDuringSession=false
+listenersCleared=true
+handledAfterLostEnd=false
+editorReactivated=true
+handledAfterActivation=true

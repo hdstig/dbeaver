@@ -1,0 +1,7 @@
+FAIL
+handledBefore=true
+handledDuringSession=false
+listenersCleared=true
+handledAfterLostEnd=false
+editorReactivated=true
+handledAfterActivation=false

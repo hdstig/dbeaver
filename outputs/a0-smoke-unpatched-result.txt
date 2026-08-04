@@ -1,0 +1,7 @@
+FAIL
+sessionStarted=true
+listenerThrew=true
+handledBefore=true
+handledAfter=false
+completionError=null
+hideError=java.lang.RuntimeException: Injected dbeaver#9414 completion-listener failure

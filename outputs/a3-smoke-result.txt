@@ -1,0 +1,15 @@
+PASS
+sessionStarted=true
+listenerThrew=true
+handledBefore=true
+handledAfter=true
+completionError=null
+hideError=java.lang.RuntimeException: Injected dbeaver#9414 completion-listener failure
+2026-07-28 11:15:47.824 - Restored lost handler for 'org.eclipse.ui.edit.text.goto.lineStart' (see dbeaver#9414)
+2026-07-28 11:15:47.824 - Restored lost handler for 'org.eclipse.ui.edit.text.goto.lineEnd' (see dbeaver#9414)
+2026-07-28 11:15:47.824 - Restored lost handler for 'org.eclipse.ui.edit.text.goto.pageUp' (see dbeaver#9414)
+2026-07-28 11:15:47.825 - Restored lost handler for 'org.eclipse.ui.edit.text.goto.pageDown' (see dbeaver#9414)
+2026-07-28 11:15:47.825 - Restored lost handler for 'org.eclipse.ui.edit.text.goto.textStart' (see dbeaver#9414)
+2026-07-28 11:15:47.825 - Restored lost handler for 'org.eclipse.ui.edit.text.goto.textEnd' (see dbeaver#9414)
+2026-07-28 11:15:47.825 - Restored lost handler for 'org.eclipse.ui.edit.text.scroll.lineUp' (see dbeaver#9414)
+2026-07-28 11:15:47.825 - Restored lost handler for 'org.eclipse.ui.edit.text.scroll.lineDown' (see dbeaver#9414)
